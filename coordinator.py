@@ -1,7 +1,7 @@
 import skopt 
 import random
 import pickle 
-
+from genetic_algorithm import GA
 from tag_lookup import tag_lookup
 
 class Coordinator(object):
@@ -22,15 +22,20 @@ class Coordinator(object):
     req_dict: dict holding MPI receive requests for each running block
     best_params: best parameter set found by Bayesian optimization
     """
-
+    
     def __init__(self, comm, num_blocks,
-                 opt_params):
+                 opt_params, ga, populationSize):
         print("Coordinator initializing")
         self.comm = comm
         self.num_blocks = num_blocks
 
         self.opt_params = opt_params
-        self.optimizer = skopt.Optimizer(dimensions=self.opt_params)
+        self.ga = ga
+        if ga:
+            self.populationSize = populationSize
+            self.optimizer = GA(self.opt_params, self.populationSize)
+        else:
+            self.optimizer = skopt.Optimizer(dimensions=self.opt_params)
         self.param_list = []
         self.fom_list = []
         self.block_dict = {}
@@ -43,7 +48,10 @@ class Coordinator(object):
     def ask(self, n_iter):
         if not self.next_params:
             ## don't ask every single time
-            self.next_params = self.optimizer.ask( n_iter )
+            if self.ga:
+                self.next_params = self.optimizer.ask()
+            else:
+                self.next_params = self.optimizer.ask( n_iter )
         return self.next_params.pop(-1)
 
     def save(self, fn = 'coordinator.pkl'):
@@ -56,32 +64,47 @@ class Coordinator(object):
         self.optimizer = pickle.load( d )
         d.close()
 
-    def fit(self):
+    def fit(self, step):
         X = [o[0] for o in self.to_tell]
         Y = [o[1] for o in self.to_tell]
-
+        
         if X and Y:
-            opt_result = self.optimizer.tell( X, Y )
-            self.best_params = opt_result.x
-            print("New best param estimate, with telling {} points : {}".format(len(X),self.best_params))
-            self.next_params = []
+            if self.ga:
+                opt_result = self.optimizer.tell( X, Y, step//self.populationSize )
+                self.best_params = opt_result[0]
+            else:
+                print('INFO')
+                print(self.to_tell)
+                print(X)
+                print(Y)
+                print('ENDINFO')
+                opt_result = self.optimizer.tell( X, Y )
+                self.best_params = opt_result.x
+                print("New best param estimate, with telling {} points : {}".format(len(X),self.best_params))
+                self.next_params = []
             self.to_tell = []
             ## checkpoint your self
             self.save()
 
-    def tell(self, params, result):
+    def tell(self, params, result, step):
+        print('************TOLD************')
+        print(params, result)
         self.to_tell.append( (params, result) )
         tell_right_away = False
         if tell_right_away:
-            self.fit()
+            self.fit(step)
         
     def run(self, num_iterations=1):
-        for step in range(num_iterations):
+        loopMax = num_iterations
+        if self.ga:
+            self.optimizer.setGenerations(num_iterations)
+            loopMax *= self.populationSize
+        for step in range(loopMax):
             print("Coordinator iteration {}".format(step))
-            next_block = self.wait_for_idle_block()
-            next_params = self.ask( num_iterations )
+            next_block = self.wait_for_idle_block(step)
+            next_params = self.ask(num_iterations)
             print("Next block: {}, next params {}".format(next_block, next_params))
-            self.run_block(next_block, next_params) 
+            self.run_block(next_block, next_params, step) 
         for proc in range(1, self.comm.Get_size()):
             print("Signaling process {} to exit".format(proc))
             self.comm.send(None, dest=proc, tag=tag_lookup('params'))
@@ -89,7 +112,7 @@ class Coordinator(object):
         print("Finished all iterations!")
         print("Best parameters found: {}".format(self.best_params))
         
-    def wait_for_idle_block(self):
+    def wait_for_idle_block(self, step):
         """
         In a loop, checks each block of processes to see if it's
         idle.  This function blocks until there is an available process.
@@ -97,15 +120,15 @@ class Coordinator(object):
         blocklist = list(range(1, self.num_blocks+1))
         
         while True:
-            self.fit()
+            self.fit(step)
             random.shuffle( blocklist ) ## look at them in random order
             for cur_block in blocklist:
-                idle = self.check_block(cur_block)
+                idle = self.check_block(cur_block, step)
                 if idle:
                     print ("from coordinator, block {} is found idling, and being used next".format( cur_block))
                     return cur_block
 
-    def check_block(self, block_num):
+    def check_block(self, block_num, step):
         """
         If the indicated block has completed a training run, store the results.
         Returns True if the block is ready to train a new model, False otherwise.
@@ -117,14 +140,14 @@ class Coordinator(object):
                 self.param_list.append(params)
                 self.fom_list.append(result)
                 print("Telling {} at {}".format(result, params))
-                self.tell( params, result )
+                self.tell( params, result, step )
                 del self.req_dict[block_num]
                 return True
             return False
         else:
             return True
 
-    def run_block(self, block_num, params):
+    def run_block(self, block_num, params, step):
         self.block_dict[block_num] = params
         # In the current setup, we need to signal each GPU in the 
         # block to start training

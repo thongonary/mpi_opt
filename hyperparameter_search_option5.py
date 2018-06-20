@@ -30,7 +30,7 @@ class BuilderFromFunction(object):
         return ModelFromJsonTF(None,
                                json_str=model_json)
 
-import coordinator
+from coordinator import Coordinator
 import process_block
 import mpiLAPI as mpi
 
@@ -63,6 +63,10 @@ def make_parser():
             dest='early_stopping', help='patience for early stopping')
     parser.add_argument('--sync-every', help='how often to sync weights with master', 
             default=1, type=int, dest='sync_every')
+    parser.add_argument('--ga', help='use genetic algorithms instead of bayesian optimization', 
+            action='store_true')
+    parser.add_argument('--population', help='population size for genetic algorithm', 
+            default=10, type=int, dest='population')
     ############################
     ## EASGD block of option
     parser.add_argument('--easgd',help='use Elastic Averaging SGD',action='store_true')
@@ -84,7 +88,7 @@ def make_parser():
                         help='Number of process per worker instance')
     parser.add_argument('--num-iterations', type=int, default=10,
                         help='The number of steps in the skopt process')
-    parser.add_argument('--example', default='mnist', choices=['topclass','mnist','gan','cifar10'])
+    parser.add_argument('--example', default='mnist', choices=['topclass','mnist','gan', 'cifar10'])
     return parser
 
 
@@ -157,9 +161,9 @@ if __name__ == '__main__':
         ### the gan example
         model_provider = GANBuilder( parameters = [ Integer(50,400, name='latent_size' ),
                                                     Real(0.0, 1.0, name='discr_drop_out'),
-                                                    Categorical([1, 2, 5, 6, 8], name='gen_weight'),
-                                                    Categorical([0.1, 0.2, 1, 2, 10], name='aux_weight'),
-                                                    Categorical([0.1, 0.2, 1, 2, 10], name='ecal_weight'),
+                                                    Integer(1, 8, name='gen_weight'),
+                                                    Real(0.1, 10, name='aux_weight'),
+                                                    Real(0.1, 10, name='ecal_weight'),
                                                 ]
         )
         ## only this mode functions
@@ -250,8 +254,8 @@ if __name__ == '__main__':
         
     # MPI process 0 coordinates the Bayesian optimization procedure
     if block_num == 0:
-        opt_coordinator = coordinator.Coordinator(comm_world, num_blocks,
-                                                  model_provider.parameters)
+        opt_coordinator = Coordinator(comm_world, num_blocks,
+                                                  model_provider.parameters, args.ga, args.population)
         opt_coordinator.run(num_iterations=args.num_iterations)
     else:
         print ("Process {} on block {}, rank {}, create a process block".format( comm_world.Get_rank(),
@@ -261,11 +265,8 @@ if __name__ == '__main__':
                       features_name=features_name,
                       labels_name=labels_name
         )
-        print('found data')
         data.set_file_names( train_list )
-        print('set file names')
         validate_every = data.count_data()/args.batch 
-        print('validate every')
         print (data.count_data(),"samples to train on")
         if args.easgd:
             algo = Algo(None, loss=args.loss, validate_every=validate_every,
